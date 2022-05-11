@@ -1,0 +1,215 @@
+#!/bin/bash
+
+CREDS_FILE=../gen/workshop-credentials.json
+
+if [ -f "$CREDS_FILE" ]
+then
+    DT_BASEURL=$(cat $CREDS_FILE | jq -r '.DT_BASEURL')
+    DT_API_TOKEN=$(cat $CREDS_FILE | jq -r '.DT_API_TOKEN')
+    HOSTNAME_SERVICES=$(cat $CREDS_FILE | jq -r '.HOSTNAME_SERVICES')
+    HOSTNAME_MONOLITH=$(cat $CREDS_FILE | jq -r '.HOSTNAME_MONOLITH')
+    CLUSTER_NAME=$(cat $CREDS_FILE | jq -r '.CLUSTER_NAME')
+else 
+  echo "ABORT: CREDS_FILE: $CREDS_FILE not found"
+  exit 1
+fi
+
+getk8FrontEndPublicIP() {
+  echo "Retrieving $CLUSTER_NAME frontend Public IP"
+  if [ -x "$(command -v kubectl)" ]; then
+    PUBLIC_IP_k8=$(kubectl -n staging get service frontend -o jsonpath="{.status.loadBalancer.ingress[0].hostname}")
+  fi
+}
+
+getMonolithPublicIP() {
+  echo "Retrieving $HOSTNAME_MONOLITH Public IP"
+  PUBLIC_IP_MONOLITH="$(aws ec2 describe-instances \
+    --filters "Name=instance-state-name,Values=running" "Name=tag:Name,Values=$HOSTNAME_MONOLITH" \
+    | jq -r '.Reservations[0].Instances[0].PublicIpAddress' )"
+}
+
+getServicesPublicIP() {
+  echo "Retrieving $HOSTNAME_SERVICES Public IP"
+  PUBLIC_IP_SERVICES="$(aws ec2 describe-instances \
+    --filters "Name=instance-state-name,Values=running" "Name=tag:Name,Values=$HOSTNAME_SERVICES" \
+    | jq -r '.Reservations[0].Instances[0].PublicIpAddress' )"
+}
+
+showAppUrls() {
+
+  getMonolithPublicIP
+  getServicesPublicIP
+  getk8FrontEndPublicIP
+  
+  echo ""
+  echo "-----------------------------------------------------------------------------------"
+  echo "Workshop Application URLs:"
+  echo "-----------------------------------------------------------------------------------"
+  echo ""
+  if ! [[ $PUBLIC_IP_MONOLITH = "null" ]]; then
+    echo "MONOLITH"
+    echo "http://$PUBLIC_IP_MONOLITH"
+    echo ""
+  fi
+  if ! [[ $PUBLIC_IP_SERVICES = "null" ]]; then
+    echo "SERVICES"
+    echo "http://$PUBLIC_IP_SERVICES"
+    echo ""
+  fi
+  if ! [ -z $PUBLIC_IP_k8 ]; then
+    echo "K8"
+    echo "http://$PUBLIC_IP_k8"
+    echo ""
+  fi
+  echo ""
+}
+
+setServicesVersion() {
+  SERVICE=$1
+  NEW_VERSION=$2
+  TAG_PROJECT=dt-orders
+
+  if [ "$SERVICE" = "order" ]; then
+    TAG_SERVICE=order-service
+    TAG_STAGE=dev
+  elif [ "$SERVICE" = "customer" ]; then
+    TAG_SERVICE=customer-service
+    TAG_STAGE=dev
+  elif [ "$SERVICE" = "backend" ]; then
+    TAG_SERVICE=backend
+    TAG_STAGE=production
+  elif [ "$SERVICE" = "k8-order" ]; then
+    SERVICE=order
+    TAG_SERVICE=order-service
+    TAG_STAGE=staging
+    MANIFEST_FILE="../app-scripts/manifests/order-service.yml"
+  elif [ "$SERVICE" = "k8-customer" ]; then
+    SERVICE=customer
+    TAG_SERVICE=customer-service
+    TAG_STAGE=staging
+    MANIFEST_FILE="../app-scripts/manifests/customer-service.yml"
+  else
+    echo "ERROR setServicesVersion(): missing or invalid SERVICE $SERVICE : must be value of [order,customer,k8-order,k8-customer or backend"
+    echo "Required arguments are: SERVICE NEW_VERSION"
+    exit 1
+  fi
+
+  if [[ "$NEW_VERSION" = "1" || "$NEW_VERSION" = "2" || "$NEW_VERSION" = "3" ]]; then
+    if [ "$TAG_STAGE" = "production" ]; then
+      getMonolithPublicIP
+      PUBLIC_IP=$PUBLIC_IP_MONOLITH
+    elif [ "$TAG_STAGE" = "staging" ]; then
+      getk8FrontEndPublicIP
+      if [ -z $PUBLIC_IP_k8 ]; then
+        echo "ERROR: Can't find k8 service. Not attempting to set version."
+        exit 1
+      fi
+      PUBLIC_IP=$PUBLIC_IP_k8
+            
+      echo ""
+      echo "Updating $MANIFEST_FILE"
+      echo "Setting version to $NEW_VERSION"
+      sed -ie "s|version: .*$|version: \"$NEW_VERSION\"|" $MANIFEST_FILE
+      sed -ie "s|image: dtdemos/dt-orders-order-service:.*$|image: dtdemos/dt-orders-order-service:$NEW_VERSION|" $MANIFEST_FILE
+      
+      echo
+      kubectl -n staging apply -f $MANIFEST_FILE
+
+    else
+      getServicesPublicIP
+      PUBLIC_IP=$PUBLIC_IP_SERVICES
+    fi
+    
+    SET_VERSION_URL="http://$PUBLIC_IP/$SERVICE/setversion/$NEW_VERSION"
+
+    echo "================================================================="
+    echo "Setting Service Version"
+    echo "SERVICE         = $SERVICE"
+    echo "NEW_VERSION     = $NEW_VERSION"
+    echo "SET_VERSION_URL = $SET_VERSION_URL"
+    echo "================================================================="
+    RETURN_MESSAGE=$(curl -s -X GET $SET_VERSION_URL)
+    if [[ "$RETURN_MESSAGE" == *"Action was successful"* || "$RETURN_MESSAGE" == *"Set version to"* ]]; then
+      echo "Set $SERVICE to $NEW_VERSION was successful"
+    else
+      echo "ERROR setServicesVersion(): Issue setting version"
+      exit 1
+    fi
+    pushDeploymentEvent $TAG_PROJECT $TAG_STAGE $TAG_SERVICE $NEW_VERSION "http://$PUBLIC_IP"
+   else
+      echo "ERROR setServicesVersion(): missing or invalid NEW_VERSION $NEW_VERSION : must be value of 1,2 or 3"
+      echo "Required arguments are: SERVICE NEW_VERSION"
+      exit 1
+  fi
+}
+
+pushDeploymentEvent() {
+  # reference: https://www.dynatrace.com/support/help/dynatrace-api/environment-api/events/post-event/
+  # example arguments: dt-orders dev order-service
+  DEPLOYMENT_PROJECT=$1
+  TAG_STAGE=$2
+  TAG_SERVICE=$3
+  DEPLOYMENT_VERSION=$4
+  CI_BACK_LINK=$5
+
+  TAG_PROJECT=$DEPLOYMENT_PROJECT
+  DT_API_URL="$DT_BASEURL/api/v1/events"
+  DEPLOYMENT_NAME="Set $TAG_SERVICE to version $DEPLOYMENT_VERSION"
+
+  echo "================================================================="
+  echo "Sending Dynatrace Deployment event"
+  echo "DT_API_URL                 = $DT_API_URL"
+  echo "DEPLOYMENT_NAME            = $DEPLOYMENT_NAME"
+  echo "DEPLOYMENT_VERSION         = $DEPLOYMENT_VERSION"
+  echo "DEPLOYMENT_PROJECT         = $DEPLOYMENT_PROJECT"
+  echo "CI_BACK_LINK               = $CI_BACK_LINK"
+  echo "================================================================="
+  POST_DATA=$(cat <<EOF
+  {
+      "eventType" : "CUSTOM_DEPLOYMENT",
+      "source" : "Custom Unix Shell Script" ,
+      "deploymentName" : "$DEPLOYMENT_NAME",
+      "deploymentVersion" : "$DEPLOYMENT_VERSION"  ,
+      "deploymentProject" : "$DEPLOYMENT_PROJECT" ,
+      "ciBackLink" : "$CI_BACK_LINK",
+      "customProperties": {
+          "Example Custom Property 1" : "Example Custom Value 1",
+          "Example Custom Property 2" : "Example Custom Value 2",
+          "Example Custom Property 3" : "Example Custom Value 3"
+      },
+      "attachRules" : {
+            "tagRule" : [
+                {
+                  "meTypes":["PROCESS_GROUP_INSTANCE"],
+                  "tags": [
+                      {
+                            "context": "CONTEXTLESS",
+                            "key": "service",
+                              "value": "$TAG_SERVICE"
+                      },
+                          {
+                            "context": "CONTEXTLESS",
+                            "key": "project",
+                              "value": "$TAG_PROJECT"
+                      },
+                          {
+                            "context": "CONTEXTLESS",
+                            "key": "stage",
+                              "value": "$TAG_STAGE"
+                      }
+            ]}
+          ]}
+        }
+  }
+EOF
+)
+  echo "Push Event POST_DATA"
+  echo $POST_DATA
+  echo ""
+  echo "Response Data"
+  curl --url "$DT_API_URL" -H "Content-type: application/json" -H "Authorization: Api-Token "$DT_API_TOKEN -X POST -d "$POST_DATA"
+
+  echo ""
+  echo ""
+
+}
